@@ -37,6 +37,8 @@ import javaposse.jobdsl.plugin.fixtures.TestContextExtensionPoint
 import javaposse.jobdsl.plugin.fixtures.TestContextExtensionPoint2
 import jenkins.model.Jenkins
 import org.custommonkey.xmlunit.XMLUnit
+import org.jenkinsci.plugins.workflow.multibranch.WorkflowBranchProjectFactory
+import org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject
 import org.junit.Rule
 import org.jvnet.hudson.test.JenkinsRule
 import org.jvnet.hudson.test.WithoutJenkins
@@ -572,6 +574,47 @@ class JenkinsJobManagementSpec extends Specification {
 
         then:
         0 * saveableListener.onChange(job, _)
+    }
+
+    def 'createOrUpdateConfig skips update of an unchanged multibranch job (JENKINS-38741)'() {
+        setup:
+        SaveableListener saveableListener = Mock(SaveableListener)
+
+        when:
+        jobManagement.createOrUpdateConfig(createItem('mb', '/multibranch.xml'), false)
+
+        then:
+        WorkflowMultiBranchProject job = jenkinsRule.jenkins.getItemByFullName('mb') as WorkflowMultiBranchProject
+
+        when:
+        // The generated config has no actions list and, as with a factory configured through the dynamic DSL,
+        // no back-reference from the factory to its owner. Jenkins adds both when it loads and persists the job.
+        job.save()
+        SaveableListener.all().add(0, saveableListener)
+        jobManagement.createOrUpdateConfig(createItem('mb', '/multibranch.xml'), false)
+
+        then:
+        0 * saveableListener.onChange(job, _)
+    }
+
+    def 'createOrUpdateConfig updates a multibranch job with a changed config (JENKINS-38741)'() {
+        setup:
+        SaveableListener saveableListener = Mock(SaveableListener)
+
+        when:
+        jobManagement.createOrUpdateConfig(createItem('mb', '/multibranch.xml'), false)
+
+        then:
+        WorkflowMultiBranchProject job = jenkinsRule.jenkins.getItemByFullName('mb') as WorkflowMultiBranchProject
+
+        when:
+        job.save()
+        SaveableListener.all().add(0, saveableListener)
+        jobManagement.createOrUpdateConfig(createItem('mb', '/multibranch-changed.xml'), false)
+
+        then:
+        1 * saveableListener.onChange(job, _)
+        (job.projectFactory as WorkflowBranchProjectFactory).scriptPath == 'Jenkinsfile.ci'
     }
 
     def 'createOrUpdateConfig should fail if item is managed by another seed and failOnSeedCollision is enabled'() {

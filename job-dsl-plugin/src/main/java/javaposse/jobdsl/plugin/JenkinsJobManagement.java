@@ -38,6 +38,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.io.StringReader;
+import java.io.StringWriter;
 import java.lang.reflect.InvocationTargetException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -59,16 +60,23 @@ import javaposse.jobdsl.dsl.JobConfigurationNotFoundException;
 import javaposse.jobdsl.dsl.NameNotProvidedException;
 import javaposse.jobdsl.dsl.UserContent;
 import javaposse.jobdsl.plugin.ExtensionPointHelper.DslExtension;
+import javax.xml.XMLConstants;
 import javax.xml.transform.Source;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
 import jenkins.branch.OrganizationFolder;
 import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import jenkins.model.Jenkins;
 import jenkins.model.ModifiableTopLevelItemGroup;
+import jenkins.util.xml.XMLUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.custommonkey.xmlunit.Diff;
 import org.custommonkey.xmlunit.XMLUnit;
 import org.jenkinsci.plugins.vSphereCloud;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
 
 /**
  * Manages Jenkins jobs, providing facilities to retrieve and create / update.
@@ -485,6 +493,62 @@ public class JenkinsJobManagement extends AbstractJobManagement {
         return sb.toString();
     }
 
+    // An XStream reference to an enclosing element, e.g. reference="../.." on an owner field.
+    private static final Pattern ANCESTOR_REFERENCE = Pattern.compile("\\.\\.(/\\.\\.)*");
+
+    /**
+     * Removes state that Jenkins rebuilds when it loads an item and that therefore cannot carry a
+     * configuration change: back-references to an enclosing object (such as the owner of a branch
+     * project factory), which are set again on load, and an empty actions list on the item, which
+     * loads the same way as a missing one. Generated configs often lack both, e.g. for multibranch
+     * jobs and organization folders or for nodes replaced through the dynamic DSL or a configure
+     * block, so without this such items compare as changed on every seed run.
+     */
+    private static String normalizeLoadTimeState(String xml) throws Exception {
+        Document document = XMLUtils.parse(new StringReader(xml));
+        Element root = document.getDocumentElement();
+        removeAncestorReferences(root);
+        for (org.w3c.dom.Node child = root.getFirstChild(); child != null; child = child.getNextSibling()) {
+            if (child instanceof Element && "actions".equals(child.getNodeName()) && !hasChildElements(child)) {
+                root.removeChild(child);
+                break;
+            }
+        }
+        TransformerFactory transformerFactory = TransformerFactory.newInstance();
+        transformerFactory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        StringWriter writer = new StringWriter();
+        transformerFactory.newTransformer().transform(new DOMSource(document), new StreamResult(writer));
+        return writer.toString();
+    }
+
+    private static void removeAncestorReferences(Element element) {
+        org.w3c.dom.Node child = element.getFirstChild();
+        while (child != null) {
+            org.w3c.dom.Node next = child.getNextSibling();
+            if (child instanceof Element) {
+                Element childElement = (Element) child;
+                if (!hasChildElements(childElement)
+                        && ANCESTOR_REFERENCE
+                                .matcher(childElement.getAttribute("reference"))
+                                .matches()) {
+                    element.removeChild(childElement);
+                } else {
+                    removeAncestorReferences(childElement);
+                }
+            }
+            child = next;
+        }
+    }
+
+    private static boolean hasChildElements(org.w3c.dom.Node node) {
+        for (org.w3c.dom.Node child = node.getFirstChild(); child != null; child = child.getNextSibling()) {
+            if (child instanceof Element) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static String sha256Hex(String value) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
@@ -534,8 +598,10 @@ public class JenkinsJobManagement extends AbstractJobManagement {
                 // ciphertext differs on each write even when the underlying value is
                 // unchanged. Replace them with a stable digest of their plaintext on both
                 // sides so only a real secret change is treated as a difference.
-                String canonicalOld = normalizeSecrets(Items.XSTREAM2.toXML(Items.XSTREAM2.fromXML(oldJob)));
-                String canonicalNew = normalizeSecrets(Items.XSTREAM2.toXML(Items.XSTREAM2.fromXML(config)));
+                String canonicalOld =
+                        normalizeLoadTimeState(normalizeSecrets(Items.XSTREAM2.toXML(Items.XSTREAM2.fromXML(oldJob))));
+                String canonicalNew =
+                        normalizeLoadTimeState(normalizeSecrets(Items.XSTREAM2.toXML(Items.XSTREAM2.fromXML(config))));
                 oldJob = canonicalOld;
                 newJob = canonicalNew;
             } catch (Exception canonEx) {
