@@ -38,12 +38,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.io.StringReader;
-import java.io.StringWriter;
 import java.lang.reflect.InvocationTargetException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -60,11 +60,7 @@ import javaposse.jobdsl.dsl.JobConfigurationNotFoundException;
 import javaposse.jobdsl.dsl.NameNotProvidedException;
 import javaposse.jobdsl.dsl.UserContent;
 import javaposse.jobdsl.plugin.ExtensionPointHelper.DslExtension;
-import javax.xml.XMLConstants;
 import javax.xml.transform.Source;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
 import jenkins.branch.OrganizationFolder;
 import jenkins.model.DirectlyModifiableTopLevelItemGroup;
@@ -77,6 +73,7 @@ import org.custommonkey.xmlunit.XMLUnit;
 import org.jenkinsci.plugins.vSphereCloud;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
+import org.xml.sax.SAXException;
 
 /**
  * Manages Jenkins jobs, providing facilities to retrieve and create / update.
@@ -493,47 +490,46 @@ public class JenkinsJobManagement extends AbstractJobManagement {
         return sb.toString();
     }
 
-    // An XStream reference to an enclosing element, e.g. reference="../.." on an owner field.
-    private static final Pattern ANCESTOR_REFERENCE = Pattern.compile("\\.\\.(/\\.\\.)*");
-
     /**
      * Removes state that Jenkins rebuilds when it loads an item and that therefore cannot carry a
-     * configuration change: back-references to an enclosing object (such as the owner of a branch
-     * project factory), which are set again on load, and an empty actions list on the item, which
-     * loads the same way as a missing one. Generated configs often lack both, e.g. for multibranch
-     * jobs and organization folders or for nodes replaced through the dynamic DSL or a configure
-     * block, so without this such items compare as changed on every seed run.
+     * configuration change: {@code owner} back-references to the item itself (e.g. the owner of a
+     * branch project factory), which are set again on load, and an empty actions list on the item,
+     * which loads the same way as a missing one. Generated configs often lack both, e.g. for
+     * multibranch jobs or for nodes replaced through the dynamic DSL or a configure block, so
+     * without this such items compare as changed on every seed run. Package-private for testing.
      */
-    private static String normalizeLoadTimeState(String xml) throws Exception {
+    static Document normalizeLoadTimeState(String xml) throws IOException, SAXException {
         Document document = XMLUtils.parse(new StringReader(xml));
         Element root = document.getDocumentElement();
-        removeAncestorReferences(root);
+        removeOwnerReferences(root, 1);
         for (org.w3c.dom.Node child = root.getFirstChild(); child != null; child = child.getNextSibling()) {
             if (child instanceof Element && "actions".equals(child.getNodeName()) && !hasChildElements(child)) {
                 root.removeChild(child);
                 break;
             }
         }
-        TransformerFactory transformerFactory = TransformerFactory.newInstance();
-        transformerFactory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-        StringWriter writer = new StringWriter();
-        transformerFactory.newTransformer().transform(new DOMSource(document), new StreamResult(writer));
-        return writer.toString();
+        return document;
     }
 
-    private static void removeAncestorReferences(Element element) {
+    /**
+     * Removes {@code owner} elements whose only content is an XStream reference to the item itself,
+     * i.e. a reference made only of {@code ..} steps that leads back to the document root element.
+     *
+     * @param depth the depth of the children of {@code element}, the root's children having depth 1
+     */
+    private static void removeOwnerReferences(Element element, int depth) {
+        String referenceToRoot = String.join("/", Collections.nCopies(depth, ".."));
         org.w3c.dom.Node child = element.getFirstChild();
         while (child != null) {
             org.w3c.dom.Node next = child.getNextSibling();
             if (child instanceof Element) {
                 Element childElement = (Element) child;
-                if (!hasChildElements(childElement)
-                        && ANCESTOR_REFERENCE
-                                .matcher(childElement.getAttribute("reference"))
-                                .matches()) {
+                if ("owner".equals(childElement.getNodeName())
+                        && !hasChildElements(childElement)
+                        && referenceToRoot.equals(childElement.getAttribute("reference"))) {
                     element.removeChild(childElement);
                 } else {
-                    removeAncestorReferences(childElement);
+                    removeOwnerReferences(childElement, depth + 1);
                 }
             }
             child = next;
@@ -591,30 +587,28 @@ public class JenkinsJobManagement extends AbstractJobManagement {
             // meaningful ordering that XStream preserves - e.g. the order of build
             // steps or publishers - is still compared, so a genuine reordering is
             // correctly detected as a change.
-            String newJob = config;
+            XMLUnit.setIgnoreWhitespace(true);
+            XMLUnit.setIgnoreComments(true);
             try {
                 // Secret-typed fields (e.g. remote-trigger authToken, passwords) are
                 // re-encrypted with a fresh random IV on every serialization, so their
                 // ciphertext differs on each write even when the underlying value is
                 // unchanged. Replace them with a stable digest of their plaintext on both
                 // sides so only a real secret change is treated as a difference.
-                String canonicalOld =
+                Document canonicalOld =
                         normalizeLoadTimeState(normalizeSecrets(Items.XSTREAM2.toXML(Items.XSTREAM2.fromXML(oldJob))));
-                String canonicalNew =
+                Document canonicalNew =
                         normalizeLoadTimeState(normalizeSecrets(Items.XSTREAM2.toXML(Items.XSTREAM2.fromXML(config))));
-                oldJob = canonicalOld;
-                newJob = canonicalNew;
+                diff = new Diff(canonicalOld, canonicalNew);
             } catch (Exception canonEx) {
-                // Canonicalization failed for one side; keep the raw strings on both
+                // Canonicalization failed for one side; compare the raw strings on both
                 // so we never compare a canonical form against a raw one. At worst we
                 // update as the unpatched plugin would have.
                 LOGGER.log(
                         Level.FINE,
                         format("Could not canonicalize config for %s: %s", item.getName(), canonEx.getMessage()));
+                diff = new Diff(oldJob, config);
             }
-            XMLUnit.setIgnoreWhitespace(true);
-            XMLUnit.setIgnoreComments(true);
-            diff = new Diff(oldJob, newJob);
             if (diff.identical()) {
                 LOGGER.log(Level.FINE, format("Item %s is identical", item.getName()));
                 notifyItemUpdated(item, dslItem);
